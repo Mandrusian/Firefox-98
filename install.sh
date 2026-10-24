@@ -1,48 +1,158 @@
 #!/usr/bin/env bash
 # install.sh - Firefox-98 theme installer
-# Detects Firefox profile, copies theme files, sets required preference.
-# Requires: dialog or whiptail. Restart Firefox after installation.
+#
+# Monochrome-terminal safe:
+#   - no ANSI color escapes, no reverse video
+#   - ASCII-only output; ncurses falls back to +-| if ACS is unavailable
+#   - backend: dialog (monochrome by default), else plain read(1) prompts
+#   - whiptail deliberately unused: newt colors cannot be neutralised portably
+#
+# Usage: ./install.sh [--variant light|dark] [--yes]
 
 set -euo pipefail
 
-TUI=$(command -v dialog || command -v whiptail || true)
-if [[ -z "$TUI" ]]; then
-    echo "Error: dialog or whiptail is required." >&2
-    echo "Void Linux: sudo xbps-install dialog" >&2
-    exit 1
-fi
+SRC_DIR="chrome"
+TUI=""
+VARIANT=""
+ASSUME_YES=0
 
-info() { "$TUI" --title "Firefox-98 Installer" --msgbox "$1" "${2:-10}" "${3:-64}"; }
-confirm() { "$TUI" --title "Confirm" --yesno "$1" "${2:-7}" "${3:-50}"; }
-err() { "$TUI" --title "Error" --msgbox "$1" 8 60; exit 1; }
+usage() { printf 'Usage: %s [--variant light|dark] [--yes]\n' "${0##*/}"; }
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --variant)
+            [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+            VARIANT=$2; shift 2 ;;
+        --variant=*) VARIANT=${1#*=}; shift ;;
+        --yes|-y)    ASSUME_YES=1; shift ;;
+        -h|--help)   usage; exit 0 ;;
+        *)           usage >&2; exit 2 ;;
+    esac
+done
+
+case "$VARIANT" in
+    ""|light|dark) ;;
+    *) printf 'Invalid variant: %s\n' "$VARIANT" >&2; exit 2 ;;
+esac
+
+command -v dialog >/dev/null 2>&1 && TUI=dialog
+
+clear_screen() {
+    if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != dumb ]; then
+        clear 2>/dev/null || true
+    fi
+}
+
+plain_info() {
+    printf '\n%s\n' "$1"
+    if [ -t 0 ]; then
+        printf '\nPress Enter to continue... '
+        read -r _ || true
+    fi
+}
+
+info() {
+    if [ "$TUI" = dialog ]; then
+        dialog --no-shadow --title "Firefox-98 Installer" \
+               --msgbox "$1" "${2:-10}" "${3:-64}" || exit 0
+    else
+        plain_info "$1"
+    fi
+}
+
+err() {
+    if [ "$TUI" = dialog ]; then
+        dialog --no-shadow --title "Error" --msgbox "$1" 9 64 || true
+    else
+        printf '\nError: %s\n' "$1" >&2
+    fi
+    exit 1
+}
+
+confirm() {
+    local ans
+    [ "$ASSUME_YES" -eq 1 ] && return 0
+    if [ "$TUI" = dialog ]; then
+        dialog --no-shadow --title "Confirm" --yesno "$1" "${2:-9}" "${3:-60}"
+        return $?
+    fi
+    printf '\n%s [y/N] ' "$1"
+    read -r ans || return 1
+    case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+choose_variant() {
+    local choice
+    if [ "$TUI" = dialog ]; then
+        choice=$(dialog --no-shadow --title "Theme Variant" \
+            --menu "Select theme variant:" 12 50 2 \
+            light "Light (default)" \
+            dark  "Dark" \
+            3>&1 1>&2 2>&3) || exit 0
+        printf '%s\n' "$choice"
+        return 0
+    fi
+    printf '\nSelect theme variant:\n'
+    printf '  1) light (default)\n'
+    printf '  2) dark\n'
+    printf 'Choice [1]: '
+    read -r choice || { printf 'light\n'; return 0; }
+    case "$choice" in
+        2|d|D|dark|Dark) printf 'dark\n' ;;
+        *)               printf 'light\n' ;;
+    esac
+}
 
 find_firefox_profile() {
-    local candidates=(
-        "$HOME/.mozilla/firefox"/*.default*
-        "$HOME/.mozilla/firefox"/*.default-release*
-        "$HOME/snap/firefox/common/.mozilla/firefox"/*.default*
+    local dir
+    for dir in \
+        "$HOME/.mozilla/firefox"/*.default* \
+        "$HOME/snap/firefox/common/.mozilla/firefox"/*.default* \
         "$HOME/.var/app/org.mozilla.firefox/.mozilla/firefox"/*.default*
-    )
-    for dir in "${candidates[@]}"; do
-        [[ -d "$dir" && -f "$dir/prefs.js" ]] && { echo "$dir"; return 0; }
+    do
+        [ -d "$dir" ] && [ -f "$dir/prefs.js" ] && { printf '%s\n' "$dir"; return 0; }
     done
     return 1
 }
 
-# Source files are in the repository's chrome/ subdirectory.
-SRC_DIR="chrome"
-THEME_FILES=("userChrome.css" "userContent.css")
+clear_screen
+
+if [ ! -d "$SRC_DIR" ]; then
+    printf 'Error: %s not found. Run this script from the repository root.\n' \
+        "$SRC_DIR" >&2
+    exit 1
+fi
+
+if [ -z "$VARIANT" ]; then
+    VARIANT=$(choose_variant) || exit 0
+fi
+
+case "$VARIANT" in
+    light)
+        CHROME_SRC="$SRC_DIR/userChrome.css"
+        CONTENT_SRC="$SRC_DIR/userContent.css" ;;
+    dark)
+        CHROME_SRC="$SRC_DIR/userChrome-dark.css"
+        CONTENT_SRC="$SRC_DIR/userContent-dark.css" ;;
+esac
+
+[ -f "$CHROME_SRC" ]  || err "Variant file not found: $CHROME_SRC"
+[ -f "$CONTENT_SRC" ] || err "Variant file not found: $CONTENT_SRC"
 
 info "Firefox-98 theme installer.
 
+Variant: $VARIANT
+
 This script will:
 1. Locate your Firefox profile directory.
-2. Copy theme files into the profile's 'chrome' folder.
-3. Set toolkit.legacyUserProfileCustomizations.stylesheets=true.
+2. Copy the selected variant into the profile's chrome/ directory.
+3. Copy the SVG assets and colors.txt alongside it.
+4. Set toolkit.legacyUserProfileCustomizations.stylesheets=true.
 
 Firefox must be restarted after installation."
 
-PROFILE_DIR=$(find_firefox_profile) || err "Could not find a Firefox profile.
+PROFILE_DIR=$(find_firefox_profile) || \
+    err "Could not find a Firefox profile.
 Launch Firefox at least once, then rerun this script."
 
 info "Profile directory:
@@ -53,15 +163,19 @@ confirm "Proceed with installation?" || exit 0
 CHROME_DIR="$PROFILE_DIR/chrome"
 mkdir -p "$CHROME_DIR"
 
-for f in "${THEME_FILES[@]}"; do
-    [[ -f "$SRC_DIR/$f" ]] || err "Required file not found: $SRC_DIR/$f"
-    cp "$SRC_DIR/$f" "$CHROME_DIR/"
+cp "$CHROME_SRC"  "$CHROME_DIR/userChrome.css"
+cp "$CONTENT_SRC" "$CHROME_DIR/userContent.css"
+
+for asset in "$SRC_DIR"/*.svg "$SRC_DIR"/colors.txt; do
+    if [ -f "$asset" ]; then
+        cp "$asset" "$CHROME_DIR/"
+    fi
 done
 
 PREFS_OUT="$PROFILE_DIR/user.js"
 PREF_LINE='user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);'
 if ! grep -qF "$PREF_LINE" "$PREFS_OUT" 2>/dev/null; then
-    echo "$PREF_LINE" >> "$PREFS_OUT"
+    printf '%s\n' "$PREF_LINE" >> "$PREFS_OUT"
 fi
 
 info "Installation complete.
@@ -69,4 +183,4 @@ info "Installation complete.
 Restart Firefox, then clear the startup cache:
 about:support > Clear startup cache" 10 64
 
-clear
+clear_screen
